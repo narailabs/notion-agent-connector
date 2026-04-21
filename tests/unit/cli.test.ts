@@ -1,14 +1,17 @@
 /**
- * Tests for notion_fetch and NotionClient.
+ * Tests for the Notion connector built on `@narai/connector-toolkit`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetch, VALID_ACTIONS } from "../../src/cli.js";
+import { buildNotionConnector } from "../../src/index.js";
 import {
   NotionClient,
   type NotionClientOptions,
 } from "../../src/lib/notion_client.js";
 
-function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
+function jsonResponse(
+  body: unknown,
+  init: { status?: number; headers?: Record<string, string> } = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status: init.status ?? 200,
     headers: {
@@ -32,6 +35,13 @@ function makeClient(
       : undefined,
     sleepImpl: async () => {},
     ...overrides,
+  });
+}
+
+function makeConnector(client: NotionClient) {
+  return buildNotionConnector({
+    sdk: async () => client,
+    credentials: async () => ({ token: "secret_test" }),
   });
 }
 
@@ -85,14 +95,15 @@ describe("NotionClient", () => {
   });
 });
 
-describe("notion_fetch.fetch", () => {
+describe("notion connector — fetch()", () => {
   beforeEach(() => {
     delete process.env["NOTION_TOKEN"];
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it("VALID_ACTIONS set", () => {
-    expect([...VALID_ACTIONS].sort()).toEqual([
+  it("exposes validActions", () => {
+    const c = buildNotionConnector();
+    expect([...c.validActions].sort()).toEqual([
       "get_database",
       "get_page",
       "query_database",
@@ -101,16 +112,28 @@ describe("notion_fetch.fetch", () => {
   });
 
   it("rejects invalid UUID", async () => {
-    const r = await fetch("get_page", { page_id: "not-a-uuid" });
-    expect(r["error_code"]).toBe("VALIDATION_ERROR");
+    const c = makeConnector(makeClient());
+    const r = await c.fetch("get_page", { page_id: "not-a-uuid" });
+    expect(r.status).toBe("error");
+    if (r.status === "error") expect(r.error_code).toBe("VALIDATION_ERROR");
+  });
+
+  it("rejects empty search query", async () => {
+    const c = makeConnector(makeClient());
+    const r = await c.fetch("search", { query: "" });
+    expect(r.status).toBe("error");
+    if (r.status === "error") expect(r.error_code).toBe("VALIDATION_ERROR");
   });
 
   it("returns CONFIG_ERROR when NOTION_TOKEN missing", async () => {
-    const r = await fetch("search", { query: "hello" });
-    expect(r["status"]).toBe("error");
-    expect(r["error_code"]).toBe("CONFIG_ERROR");
-    expect(r["retriable"]).toBe(false);
-    expect(r["message"]).toContain("NOTION_TOKEN");
+    const c = buildNotionConnector();
+    const r = await c.fetch("search", { query: "hello" });
+    expect(r.status).toBe("error");
+    if (r.status === "error") {
+      expect(r.error_code).toBe("CONFIG_ERROR");
+      expect(r.retriable).toBe(false);
+      expect(r.message).toContain("NOTION_TOKEN");
+    }
   });
 
   it("extracts title via property shape", async () => {
@@ -127,38 +150,65 @@ describe("notion_fetch.fetch", () => {
         },
       }),
     );
-    const r = await fetch(
-      "get_page",
-      { page_id: SAMPLE_DB_ID },
-      { client },
+    const c = makeConnector(client);
+    const r = await c.fetch("get_page", { page_id: SAMPLE_DB_ID });
+    expect(r.status).toBe("success");
+    if (r.status === "success") {
+      expect(r.data["title"]).toBe("Hello World");
+    }
+  });
+
+  it("search returns shaped envelope", async () => {
+    const client = makeClient({}, async () =>
+      jsonResponse({
+        has_more: false,
+        results: [
+          { id: "p1-abcd", last_edited_time: "t", properties: {} },
+          { id: "d1-wxyz", title: [{ plain_text: "DB" }] },
+        ],
+      }),
     );
-    expect(r["status"]).toBe("success");
-    expect((r["data"] as Record<string, unknown>)["title"]).toBe("Hello World");
+    const c = makeConnector(client);
+    const r = await c.fetch("search", { query: "arch" });
+    expect(r.status).toBe("success");
+    if (r.status === "success") {
+      const results = r.data["results"] as Array<Record<string, unknown>>;
+      expect(results).toHaveLength(2);
+      expect(results[0]!["object_type"]).toBe("page");
+      expect(results[1]!["object_type"]).toBe("database");
+    }
   });
 
   it("surfaces 401 as AUTH_ERROR", async () => {
     const client = makeClient({}, async () =>
       jsonResponse({ error: "unauthorized" }, { status: 401 }),
     );
-    const r = await fetch(
-      "get_database",
-      { database_id: SAMPLE_DB_ID },
-      { client },
-    );
-    expect(r["error_code"]).toBe("AUTH_ERROR");
+    const c = makeConnector(client);
+    const r = await c.fetch("get_database", { database_id: SAMPLE_DB_ID });
+    expect(r.status).toBe("error");
+    if (r.status === "error") expect(r.error_code).toBe("AUTH_ERROR");
   });
-});
 
-describe("envelope is wiki-agnostic (no Mermaid in Layer 1)", () => {
-  it("search does NOT include a mermaid field", async () => {
+  it("surfaces 404 as NOT_FOUND", async () => {
+    const client = makeClient({}, async () => jsonResponse({}, { status: 404 }));
+    const c = makeConnector(client);
+    const r = await c.fetch("get_page", { page_id: SAMPLE_DB_ID });
+    expect(r.status).toBe("error");
+    if (r.status === "error") expect(r.error_code).toBe("NOT_FOUND");
+  });
+
+  it("envelope is wiki-agnostic — no mermaid field", async () => {
     const client = makeClient({}, async () =>
       jsonResponse({
         has_more: false,
         results: [{ id: "p1-abcd", last_edited_time: "t", properties: {} }],
       }),
     );
-    const r = await fetch("search", { query: "arch" }, { client });
-    expect(r["status"]).toBe("success");
-    expect(r["mermaid"]).toBeUndefined();
+    const c = makeConnector(client);
+    const r = await c.fetch("search", { query: "arch" });
+    expect(r.status).toBe("success");
+    if (r.status === "success") {
+      expect(r.data["mermaid"]).toBeUndefined();
+    }
   });
 });

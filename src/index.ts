@@ -1,19 +1,246 @@
 /**
  * @narai/notion-agent-connector — read-only Notion connector.
  *
- * Public API:
- *   - `fetch(action, params)` — run an action, get a JSON envelope.
- *   - `VALID_ACTIONS` — the set of supported action names.
- *   - `NotionClient` — lower-level HTTP client.
+ * Built on @narai/connector-toolkit. The default export is a ready-to-use
+ * `Connector` instance; `buildNotionConnector(overrides?)` is exposed
+ * for tests that want to inject a fake Notion client.
  */
-export {
-  fetch,
-  main,
-  VALID_ACTIONS,
-  type FetchResult,
-  type FetchOptions,
-} from "./cli.js";
+import { createConnector, type Connector, type ErrorCode } from "@narai/connector-toolkit";
+import { z } from "zod";
+import {
+  NotionClient,
+  extractTitleFromPage,
+  loadNotionCredentials,
+  type NotionResult,
+} from "./lib/notion_client.js";
+import { NotionError } from "./lib/notion_error.js";
 
+// ───────────────────────────────────────────────────────────────────────────
+// Param schemas
+// ───────────────────────────────────────────────────────────────────────────
+
+const MAX_RESULTS_DEFAULT = 25;
+const MAX_RESULTS_CAP = 100;
+
+const UUID_RE =
+  /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$/;
+
+const uuidField = (fieldName: string) =>
+  z
+    .string()
+    .transform((s) => s.trim().toLowerCase())
+    .pipe(
+      z
+        .string()
+        .regex(UUID_RE, `Invalid ${fieldName} — expected UUID format`),
+    );
+
+const searchParams = z.object({
+  query: z.string().min(1, "search requires a non-empty 'query' string"),
+  filter_type: z
+    .union([z.literal("page"), z.literal("database"), z.literal("")])
+    .default(""),
+  max_results: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(MAX_RESULTS_DEFAULT),
+});
+
+const getPageParams = z.object({
+  page_id: uuidField("page_id"),
+});
+
+const getDatabaseParams = z.object({
+  database_id: uuidField("database_id"),
+});
+
+const queryDatabaseParams = z.object({
+  database_id: uuidField("database_id"),
+  filter: z.record(z.unknown()).nullable().default(null),
+  max_results: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(MAX_RESULTS_DEFAULT),
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Error-code translation: Notion client codes → toolkit canonical codes
+// ───────────────────────────────────────────────────────────────────────────
+
+const CODE_MAP: Record<string, ErrorCode> = {
+  UNAUTHORIZED: "AUTH_ERROR",
+  FORBIDDEN: "AUTH_ERROR",
+  NOT_FOUND: "NOT_FOUND",
+  RATE_LIMITED: "RATE_LIMITED",
+  TIMEOUT: "TIMEOUT",
+  NETWORK_ERROR: "CONNECTION_ERROR",
+  SERVER_ERROR: "CONNECTION_ERROR",
+  BAD_REQUEST: "VALIDATION_ERROR",
+  UNPROCESSABLE: "VALIDATION_ERROR",
+  INVALID_URL: "VALIDATION_ERROR",
+  METHOD_NOT_ALLOWED: "VALIDATION_ERROR",
+  HTTP_ERROR: "CONNECTION_ERROR",
+  CONFIG_ERROR: "CONFIG_ERROR",
+};
+
+function throwIfError<T>(
+  result: NotionResult<T>,
+): asserts result is Extract<NotionResult<T>, { ok: true }> {
+  if (!result.ok) {
+    throw new NotionError(
+      result.code,
+      result.message,
+      result.retriable,
+      result.status,
+    );
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Connector factory
+// ───────────────────────────────────────────────────────────────────────────
+
+export interface BuildOptions {
+  sdk?: () => Promise<NotionClient>;
+  credentials?: () => Promise<Record<string, unknown>>;
+}
+
+export function buildNotionConnector(overrides: BuildOptions = {}): Connector {
+  const defaultCredentials = async (): Promise<Record<string, unknown>> => {
+    const creds = await loadNotionCredentials();
+    return (creds as unknown as Record<string, unknown> | null) ?? {};
+  };
+
+  const defaultSdk = async (): Promise<NotionClient> => {
+    const creds = await loadNotionCredentials();
+    if (!creds) {
+      throw new NotionError(
+        "CONFIG_ERROR",
+        "Notion credentials not configured. Set NOTION_TOKEN or register a " +
+          "credential provider via @narai/credential-providers.",
+        false,
+      );
+    }
+    return new NotionClient(creds);
+  };
+
+  return createConnector<NotionClient>({
+    name: "notion",
+    version: "2.0.0",
+    credentials: overrides.credentials ?? defaultCredentials,
+    sdk: overrides.sdk ?? defaultSdk,
+    actions: {
+      search: {
+        description: "Search Notion for pages or databases by text query",
+        params: searchParams,
+        classify: { kind: "read" },
+        handler: async (p: z.infer<typeof searchParams>, ctx) => {
+          const limit = Math.min(p.max_results, MAX_RESULTS_CAP);
+          const filterType = p.filter_type === "" ? undefined : p.filter_type;
+          const result = await ctx.sdk.search(p.query, filterType, limit);
+          throwIfError(result);
+          const results = Array.isArray(result.data.results)
+            ? result.data.results
+            : [];
+          return {
+            total: results.length,
+            results: results.map((r) => ({
+              id: r.id,
+              object_type:
+                "last_edited_time" in r && "properties" in r
+                  ? "page"
+                  : "database",
+            })),
+            truncated: Boolean(result.data.has_more),
+          };
+        },
+      },
+      get_page: {
+        description: "Fetch a Notion page by UUID",
+        params: getPageParams,
+        classify: { kind: "read" },
+        handler: async (p: z.infer<typeof getPageParams>, ctx) => {
+          const result = await ctx.sdk.getPage(p.page_id);
+          throwIfError(result);
+          const page = result.data;
+          return {
+            id: page.id,
+            title: extractTitleFromPage(page),
+            parent_type: page.parent?.type ?? "",
+            last_edited: page.last_edited_time ?? null,
+            properties: page.properties ?? {},
+            content_markdown: "",
+          };
+        },
+      },
+      get_database: {
+        description: "Fetch a Notion database schema by UUID",
+        params: getDatabaseParams,
+        classify: { kind: "read" },
+        handler: async (p: z.infer<typeof getDatabaseParams>, ctx) => {
+          const result = await ctx.sdk.getDatabase(p.database_id);
+          throwIfError(result);
+          const db = result.data;
+          return {
+            id: db.id,
+            title: (db.title ?? []).map((t) => t.plain_text ?? "").join(""),
+            description: (db.description ?? [])
+              .map((t) => t.plain_text ?? "")
+              .join(""),
+            properties: db.properties ?? {},
+            is_inline: db.is_inline ?? false,
+          };
+        },
+      },
+      query_database: {
+        description: "Query a Notion database with optional filter",
+        params: queryDatabaseParams,
+        classify: { kind: "read" },
+        handler: async (p: z.infer<typeof queryDatabaseParams>, ctx) => {
+          const limit = Math.min(p.max_results, MAX_RESULTS_CAP);
+          const result = await ctx.sdk.queryDatabase(
+            p.database_id,
+            p.filter,
+            limit,
+          );
+          throwIfError(result);
+          const results = Array.isArray(result.data.results)
+            ? result.data.results
+            : [];
+          return {
+            database_id: p.database_id,
+            total: results.length,
+            results: results.map((r) => ({
+              id: r.id,
+              title: extractTitleFromPage(r),
+              last_edited: r.last_edited_time ?? null,
+            })),
+            truncated: Boolean(result.data.has_more),
+          };
+        },
+      },
+    },
+    mapError: (err) => {
+      if (err instanceof NotionError) {
+        return {
+          error_code: CODE_MAP[err.code] ?? "CONNECTION_ERROR",
+          message: err.message,
+          retriable: err.retriable,
+        };
+      }
+      return undefined;
+    },
+  });
+}
+
+// Default production connector.
+const connector = buildNotionConnector();
+export default connector;
+export const { main, fetch, validActions } = connector;
+
+// Re-exports for advanced consumers.
 export {
   NotionClient,
   extractTitleFromPage,
@@ -21,3 +248,4 @@ export {
   type NotionClientOptions,
   type NotionResult,
 } from "./lib/notion_client.js";
+export { NotionError } from "./lib/notion_error.js";
