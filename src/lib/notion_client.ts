@@ -254,6 +254,183 @@ export class NotionClient {
       body,
     );
   }
+
+  public async listPageFileBlocks(
+    pageId: string,
+    pageSize = 100,
+  ): Promise<NotionResult<NotionFileBlockList>> {
+    const raw = await this.request<NotionBlockChildrenResponse>(
+      "GET",
+      `/v1/blocks/${pageId}/children?page_size=${pageSize}`,
+    );
+    if (!raw.ok) return raw;
+    const blocks = raw.data.results ?? [];
+    const results: NotionFileBlock[] = [];
+    for (const b of blocks) {
+      const fb = normalizeFileBlock(b);
+      if (fb) results.push(fb);
+    }
+    return {
+      ok: true,
+      status: raw.status,
+      data: {
+        results,
+        has_more: raw.data.has_more ?? false,
+      },
+    };
+  }
+
+  public async getBlock(
+    blockId: string,
+  ): Promise<NotionResult<NotionRawBlock>> {
+    return this.request<NotionRawBlock>("GET", `/v1/blocks/${blockId}`);
+  }
+
+  public async getComments(
+    blockId: string,
+    pageSize = 100,
+  ): Promise<NotionResult<NotionCommentList>> {
+    const raw = await this.request<NotionRawCommentResponse>(
+      "GET",
+      `/v1/comments?block_id=${blockId}&page_size=${pageSize}`,
+    );
+    if (!raw.ok) return raw;
+    const results: NotionComment[] = (raw.data.results ?? []).map((c) => ({
+      id: c.id,
+      author_id: c.created_by?.id ?? "",
+      created: c.created_time ?? "",
+      body_plain: (c.rich_text ?? [])
+        .map((rt) => rt.plain_text ?? "")
+        .join(""),
+      parent_page_id: c.parent?.page_id ?? null,
+    }));
+    return {
+      ok: true,
+      status: raw.status,
+      data: { results, has_more: raw.data.has_more ?? false },
+    };
+  }
+}
+
+// ── File-block normalization ───────────────────────────────────────────
+
+export type NotionFileBlockType = "file" | "image" | "pdf" | "audio" | "video";
+const FILE_BLOCK_TYPES: ReadonlySet<string> = new Set<NotionFileBlockType>([
+  "file",
+  "image",
+  "pdf",
+  "audio",
+  "video",
+]);
+
+export interface NotionFileBlock {
+  id: string;
+  type: NotionFileBlockType;
+  url_type: "file" | "external";
+  url: string;
+  expiry_time: string | null;
+  caption: string;
+  filename: string | null;
+}
+
+export interface NotionFileBlockList {
+  results: NotionFileBlock[];
+  has_more: boolean;
+}
+
+export interface NotionComment {
+  id: string;
+  author_id: string;
+  created: string;
+  body_plain: string;
+  parent_page_id: string | null;
+}
+
+export interface NotionCommentList {
+  results: NotionComment[];
+  has_more: boolean;
+}
+
+interface NotionRichText {
+  plain_text?: string;
+}
+
+export interface NotionRawBlock {
+  id: string;
+  type?: string;
+  [k: string]: unknown;
+}
+
+interface NotionBlockChildrenResponse {
+  results?: NotionRawBlock[];
+  has_more?: boolean;
+  next_cursor?: string | null;
+}
+
+interface NotionRawComment {
+  id: string;
+  created_by?: { id?: string };
+  created_time?: string;
+  rich_text?: NotionRichText[];
+  parent?: { page_id?: string };
+}
+
+interface NotionRawCommentResponse {
+  results?: NotionRawComment[];
+  has_more?: boolean;
+}
+
+function normalizeFileBlock(block: NotionRawBlock): NotionFileBlock | null {
+  if (typeof block.type !== "string" || !FILE_BLOCK_TYPES.has(block.type)) {
+    return null;
+  }
+  const type = block.type as NotionFileBlockType;
+  const payload = block[type];
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const urlType = p["type"];
+  if (urlType !== "file" && urlType !== "external") return null;
+
+  let url = "";
+  let expiry: string | null = null;
+  if (urlType === "file") {
+    const f = p["file"];
+    if (f && typeof f === "object") {
+      const obj = f as Record<string, unknown>;
+      if (typeof obj["url"] === "string") url = obj["url"];
+      if (typeof obj["expiry_time"] === "string") expiry = obj["expiry_time"];
+    }
+  } else {
+    const e = p["external"];
+    if (e && typeof e === "object") {
+      const obj = e as Record<string, unknown>;
+      if (typeof obj["url"] === "string") url = obj["url"];
+    }
+  }
+  if (!url) return null;
+
+  const captionArr = Array.isArray(p["caption"]) ? p["caption"] : [];
+  const caption = captionArr
+    .map((rt: unknown) => {
+      if (rt && typeof rt === "object") {
+        const t = (rt as Record<string, unknown>)["plain_text"];
+        return typeof t === "string" ? t : "";
+      }
+      return "";
+    })
+    .join("");
+  const filename =
+    typeof p["name"] === "string" ? (p["name"] as string) : null;
+
+  return {
+    id: block.id,
+    type,
+    url_type: urlType as "file" | "external",
+    url,
+    expiry_time: expiry,
+    caption,
+    filename,
+  };
 }
 
 export interface NotionPage {

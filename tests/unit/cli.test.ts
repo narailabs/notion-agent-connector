@@ -47,6 +47,121 @@ function makeConnector(client: NotionClient) {
 
 const SAMPLE_DB_ID = "a1b2c3d4e5f6789012345678901234ab";
 
+describe("NotionClient — attachments + comments", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("listPageFileBlocks filters file-type blocks from block children", async () => {
+    let calledUrl = "";
+    const client = makeClient({}, async (url) => {
+      calledUrl = url;
+      return jsonResponse({
+        results: [
+          {
+            id: "b1",
+            type: "paragraph",
+            paragraph: { rich_text: [] },
+          },
+          {
+            id: "b2",
+            type: "file",
+            file: {
+              type: "file",
+              file: {
+                url: "https://s3.notion.so/signed-url",
+                expiry_time: "2026-04-21T01:00:00Z",
+              },
+              name: "report.pdf",
+              caption: [{ plain_text: "Q1 report" }],
+            },
+          },
+          {
+            id: "b3",
+            type: "image",
+            image: {
+              type: "external",
+              external: { url: "https://example.com/pic.png" },
+              caption: [],
+            },
+          },
+          {
+            id: "b4",
+            type: "pdf",
+            pdf: {
+              type: "file",
+              file: { url: "https://s3.notion.so/x.pdf", expiry_time: "..." },
+              caption: [],
+            },
+          },
+        ],
+        has_more: false,
+        next_cursor: null,
+      });
+    });
+    const r = await client.listPageFileBlocks("pageid123");
+    expect(calledUrl).toMatch(/\/v1\/blocks\/pageid123\/children/);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.results).toHaveLength(3);
+      expect(r.data.results[0]?.id).toBe("b2");
+      expect(r.data.results[0]?.type).toBe("file");
+      expect(r.data.results[0]?.url_type).toBe("file");
+      expect(r.data.results[0]?.filename).toBe("report.pdf");
+      expect(r.data.results[1]?.url_type).toBe("external");
+      expect(r.data.results[2]?.type).toBe("pdf");
+    }
+  });
+
+  it("getBlock re-fetches a single block (for URL re-sign)", async () => {
+    let calledUrl = "";
+    const client = makeClient({}, async (url) => {
+      calledUrl = url;
+      return jsonResponse({
+        id: "b2",
+        type: "file",
+        file: {
+          type: "file",
+          file: { url: "https://fresh.signed/url", expiry_time: "..." },
+          name: "report.pdf",
+        },
+      });
+    });
+    const r = await client.getBlock("b2");
+    expect(calledUrl).toMatch(/\/v1\/blocks\/b2$/);
+    expect(r.ok).toBe(true);
+  });
+
+  it("getComments returns comment list for a block", async () => {
+    let calledUrl = "";
+    const client = makeClient({}, async (url) => {
+      calledUrl = url;
+      return jsonResponse({
+        results: [
+          {
+            id: "cm1",
+            created_by: { id: "user1" },
+            created_time: "2026-04-01T00:00:00Z",
+            rich_text: [
+              { plain_text: "Hello " },
+              { plain_text: "world" },
+            ],
+            parent: { page_id: "pageid123" },
+          },
+        ],
+        has_more: false,
+      });
+    });
+    const r = await client.getComments("pageid123");
+    expect(calledUrl).toMatch(/\/v1\/comments\?/);
+    expect(calledUrl).toMatch(/block_id=pageid123/);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.results).toHaveLength(1);
+      expect(r.data.results[0]?.id).toBe("cm1");
+      expect(r.data.results[0]?.body_plain).toBe("Hello world");
+    }
+  });
+});
+
 describe("NotionClient", () => {
   afterEach(() => vi.restoreAllMocks());
 
