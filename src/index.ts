@@ -5,13 +5,20 @@
  * `Connector` instance; `buildNotionConnector(overrides?)` is exposed
  * for tests that want to inject a fake Notion client.
  */
-import { createConnector, type Connector, type ErrorCode } from "@narai/connector-toolkit";
+import {
+  createConnector,
+  fetchAttachment,
+  sanitizeLabel,
+  type Connector,
+  type ErrorCode,
+} from "@narai/connector-toolkit";
 import { z } from "zod";
 import {
   NotionClient,
   extractTitleFromPage,
   loadNotionCredentials,
   type NotionResult,
+  type NotionRawBlock,
 } from "./lib/notion_client.js";
 import { NotionError } from "./lib/notion_error.js";
 
@@ -65,6 +72,19 @@ const queryDatabaseParams = z.object({
     .default(MAX_RESULTS_DEFAULT),
 });
 
+const listAttachmentsParams = z.object({
+  page_id: uuidField("page_id"),
+});
+
+const getAttachmentParams = z.object({
+  page_id: uuidField("page_id"),
+  block_id: uuidField("block_id"),
+});
+
+const getCommentsParams = z.object({
+  page_id: uuidField("page_id"),
+});
+
 // ───────────────────────────────────────────────────────────────────────────
 // Error-code translation: Notion client codes → toolkit canonical codes
 // ───────────────────────────────────────────────────────────────────────────
@@ -96,6 +116,44 @@ function throwIfError<T>(
       result.status,
     );
   }
+}
+
+const FILE_BLOCK_TYPES = new Set([
+  "file",
+  "image",
+  "pdf",
+  "audio",
+  "video",
+]);
+
+function normalizeFileBlockForFetch(
+  block: NotionRawBlock,
+): { type: string; url: string; filename: string | null } | null {
+  if (typeof block.type !== "string" || !FILE_BLOCK_TYPES.has(block.type)) {
+    return null;
+  }
+  const payload = block[block.type];
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const sub = p["type"];
+  let url = "";
+  if (sub === "file") {
+    const f = p["file"];
+    if (f && typeof f === "object") {
+      const u = (f as Record<string, unknown>)["url"];
+      if (typeof u === "string") url = u;
+    }
+  } else if (sub === "external") {
+    const e = p["external"];
+    if (e && typeof e === "object") {
+      const u = (e as Record<string, unknown>)["url"];
+      if (typeof u === "string") url = u;
+    }
+  }
+  if (!url) return null;
+  const filename =
+    typeof p["name"] === "string" ? (p["name"] as string) : null;
+  return { type: block.type, url, filename };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -218,6 +276,85 @@ export function buildNotionConnector(overrides: BuildOptions = {}): Connector {
               last_edited: r.last_edited_time ?? null,
             })),
             truncated: Boolean(result.data.has_more),
+          };
+        },
+      },
+      list_attachments: {
+        description: "List file/image/pdf/audio/video blocks on a Notion page",
+        params: listAttachmentsParams,
+        classify: { kind: "read" },
+        handler: async (p: z.infer<typeof listAttachmentsParams>, ctx) => {
+          const result = await ctx.sdk.listPageFileBlocks(p.page_id);
+          throwIfError(result);
+          const results = result.data.results ?? [];
+          return {
+            page_id: p.page_id,
+            total: results.length,
+            attachments: results.map((b) => ({
+              attachment_id: b.id,
+              block_type: b.type,
+              url_type: b.url_type,
+              expiry_time: b.expiry_time,
+              caption: b.caption,
+              filename: b.filename ?? null,
+            })),
+            truncated: result.data.has_more,
+          };
+        },
+      },
+      get_attachment: {
+        description:
+          "Download and extract a Notion file/image/pdf/audio/video block",
+        params: getAttachmentParams,
+        classify: { kind: "read" },
+        handler: async (p: z.infer<typeof getAttachmentParams>, ctx) => {
+          const blockRes = await ctx.sdk.getBlock(p.block_id);
+          throwIfError(blockRes);
+          const normalized = normalizeFileBlockForFetch(blockRes.data);
+          if (!normalized) {
+            throw new NotionError(
+              "BAD_REQUEST",
+              `Block ${p.block_id} is not a downloadable file/image/pdf/audio/video block`,
+              false,
+              400,
+            );
+          }
+          const attachment = await fetchAttachment(normalized.url);
+          return {
+            attachment_id: p.block_id,
+            page_id: p.page_id,
+            block_type: normalized.type,
+            filename: sanitizeLabel(
+              normalized.filename ?? attachment.filename,
+              255,
+            ),
+            media_type: attachment.contentType,
+            size_bytes: attachment.sizeBytes,
+            checksum: attachment.checksum,
+            extracted: attachment.extracted,
+            source_url: attachment.sourceUrl,
+          };
+        },
+      },
+      get_comments: {
+        description: "List page-level comments on a Notion page",
+        params: getCommentsParams,
+        classify: { kind: "read" },
+        handler: async (p: z.infer<typeof getCommentsParams>, ctx) => {
+          const result = await ctx.sdk.getComments(p.page_id);
+          throwIfError(result);
+          const results = result.data.results ?? [];
+          return {
+            page_id: p.page_id,
+            total: results.length,
+            comments: results.map((c) => ({
+              comment_id: c.id,
+              author_id: c.author_id,
+              created: c.created,
+              body_plain: c.body_plain,
+              parent_page_id: c.parent_page_id,
+            })),
+            truncated: result.data.has_more,
           };
         },
       },

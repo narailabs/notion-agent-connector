@@ -219,11 +219,143 @@ describe("notion connector — fetch()", () => {
   it("exposes validActions", () => {
     const c = buildNotionConnector();
     expect([...c.validActions].sort()).toEqual([
+      "get_attachment",
+      "get_comments",
       "get_database",
       "get_page",
+      "list_attachments",
       "query_database",
       "search",
     ]);
+  });
+
+  it("list_attachments returns normalized file-block list", async () => {
+    const pageId = "a1b2c3d4e5f6789012345678901234ab";
+    const client = makeClient({}, async (url) => {
+      if (url.includes(`/blocks/${pageId}/children`)) {
+        return jsonResponse({
+          results: [
+            {
+              id: "b2",
+              type: "pdf",
+              pdf: {
+                type: "file",
+                file: {
+                  url: "https://s3.notion.so/x.pdf",
+                  expiry_time: "2026-04-21T01:00:00Z",
+                },
+                caption: [{ plain_text: "Doc" }],
+                name: "plan.pdf",
+              },
+            },
+          ],
+          has_more: false,
+        });
+      }
+      return jsonResponse({});
+    });
+    const c = makeConnector(client);
+    const r = await c.fetch("list_attachments", { page_id: pageId });
+    expect(r.status).toBe("success");
+    if (r.status === "success") {
+      const atts = r.data["attachments"] as Array<Record<string, unknown>>;
+      expect(atts).toHaveLength(1);
+      expect(atts[0]?.["attachment_id"]).toBe("b2");
+      expect(atts[0]?.["block_type"]).toBe("pdf");
+      expect(atts[0]?.["caption"]).toBe("Doc");
+      expect(atts[0]?.["filename"]).toBe("plan.pdf");
+    }
+  });
+
+  it("get_attachment fetches fresh URL + downloads via fetchAttachment", async () => {
+    const pageId = "a1b2c3d4e5f6789012345678901234ab";
+    const blockId = "b1b2c3d4e5f6789012345678901234ab";
+    const body = new TextEncoder().encode("hello world");
+    const client = makeClient({}, async (url) => {
+      if (url.endsWith(`/v1/blocks/${blockId}`)) {
+        return jsonResponse({
+          id: blockId,
+          type: "file",
+          file: {
+            type: "external",
+            external: { url: "https://example.com/report.txt" },
+            name: "report.txt",
+          },
+        });
+      }
+      return jsonResponse({});
+    });
+    const c = makeConnector(client);
+    // Inject a global.fetch replacement for the external URL download.
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      })) as typeof fetch;
+    try {
+      const r = await c.fetch("get_attachment", {
+        page_id: pageId,
+        block_id: blockId,
+      });
+      expect(r.status).toBe("success");
+      if (r.status === "success") {
+        expect(r.data["block_type"]).toBe("file");
+        expect(r.data["filename"]).toBe("report.txt");
+        expect(r.data["media_type"]).toBe("text/plain");
+        const extracted = r.data["extracted"] as Record<string, unknown>;
+        expect(extracted["format"]).toBe("text");
+        expect(extracted["text"]).toBe("hello world");
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("get_attachment rejects non-file blocks", async () => {
+    const pageId = "a1b2c3d4e5f6789012345678901234ab";
+    const blockId = "b1b2c3d4e5f6789012345678901234ab";
+    const client = makeClient({}, async () =>
+      jsonResponse({
+        id: blockId,
+        type: "paragraph",
+        paragraph: { rich_text: [] },
+      }),
+    );
+    const c = makeConnector(client);
+    const r = await c.fetch("get_attachment", {
+      page_id: pageId,
+      block_id: blockId,
+    });
+    expect(r.status).toBe("error");
+    if (r.status === "error") expect(r.error_code).toBe("VALIDATION_ERROR");
+  });
+
+  it("get_comments returns comment list", async () => {
+    const pageId = "a1b2c3d4e5f6789012345678901234ab";
+    const client = makeClient({}, async () =>
+      jsonResponse({
+        results: [
+          {
+            id: "cm1",
+            created_by: { id: "u1" },
+            created_time: "2026-04-01T00:00:00Z",
+            rich_text: [{ plain_text: "hi" }],
+            parent: { page_id: pageId },
+          },
+        ],
+        has_more: false,
+      }),
+    );
+    const c = makeConnector(client);
+    const r = await c.fetch("get_comments", { page_id: pageId });
+    expect(r.status).toBe("success");
+    if (r.status === "success") {
+      const comments = r.data["comments"] as Array<Record<string, unknown>>;
+      expect(comments).toHaveLength(1);
+      expect(comments[0]?.["body_plain"]).toBe("hi");
+      expect(comments[0]?.["author_id"]).toBe("u1");
+    }
   });
 
   it("rejects invalid UUID", async () => {
