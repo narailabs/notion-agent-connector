@@ -77,6 +77,37 @@ export class NotionClient {
   private readonly _fetch: typeof globalThis.fetch;
   private readonly _sleep: (ms: number) => Promise<void>;
   private _requestTimestamps: number[] = [];
+  private _workspaceId: string | null = null;
+
+  get workspaceId(): string | null {
+    return this._workspaceId;
+  }
+
+  /**
+   * Best-effort lookup of the workspace id via `GET /v1/users/me`. Never
+   * throws: on any failure `workspaceId` remains `null` and the scope
+   * callback demotes to the global tier.
+   */
+  public async init(): Promise<void> {
+    try {
+      const result = await this.request<{ bot?: { workspace_id?: string } }>(
+        "GET",
+        "/v1/users/me",
+      );
+      if (result.ok) {
+        this._workspaceId = result.data.bot?.workspace_id ?? null;
+      } else {
+        process.stderr.write(
+          `[notion] init: workspaceId lookup failed (${result.code})\n`,
+        );
+        this._workspaceId = null;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[notion] init: workspaceId lookup threw (${msg})\n`);
+      this._workspaceId = null;
+    }
+  }
 
   constructor(opts: NotionClientOptions) {
     const base = opts.apiBase ?? NOTION_API_BASE;

@@ -181,16 +181,15 @@ export function buildNotionConnector(overrides: BuildOptions = {}): Connector {
         false,
       );
     }
-    return new NotionClient(creds);
+    const client = new NotionClient(creds);
+    await client.init();
+    return client;
   };
 
   return createConnector<NotionClient>({
     name: "notion",
-    version: "3.0.0",
-    // TODO(scope): workspaceId requires GET /v1/users/me at init; use null for now.
-    // Once NotionClient stores workspaceId (loaded at construction time), change to:
-    //   scope: (ctx) => ctx.sdk.workspaceId
-    scope: () => null,
+    version: "3.0.1",
+    scope: (ctx) => ctx.sdk.workspaceId,
     credentials: overrides.credentials ?? defaultCredentials,
     sdk: overrides.sdk ?? defaultSdk,
     actions: {

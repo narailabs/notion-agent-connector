@@ -1,6 +1,6 @@
 {
   "name": "@narai/notion-agent-connector",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Read-only Notion connector: search, pages, databases. Built on @narai/connector-toolkit with an approval gate and hardship logging. JSON-envelope CLI + library API.",
   "type": "module",
   "main": "./dist/index.js",
