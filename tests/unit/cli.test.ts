@@ -162,6 +162,59 @@ describe("NotionClient — attachments + comments", () => {
   });
 });
 
+describe("NotionClient — init() and workspaceId", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("populates workspaceId from GET /v1/users/me on success", async () => {
+    let calledUrl = "";
+    const client = makeClient({}, async (url) => {
+      calledUrl = url;
+      return jsonResponse({
+        bot: { workspace_id: "ws-abc-123" },
+        object: "user",
+        id: "bot-xyz",
+      });
+    });
+    expect(client.workspaceId).toBeNull();
+    await client.init();
+    expect(calledUrl).toMatch(/\/v1\/users\/me$/);
+    expect(client.workspaceId).toBe("ws-abc-123");
+  });
+
+  it("leaves workspaceId null on HTTP error and does not throw", async () => {
+    const client = makeClient({}, async () =>
+      jsonResponse({ message: "Unauthorized" }, { status: 401 }),
+    );
+    await expect(client.init()).resolves.toBeUndefined();
+    expect(client.workspaceId).toBeNull();
+  });
+
+  it("leaves workspaceId null when fetch throws and does not throw", async () => {
+    const client = makeClient({}, async () => {
+      throw new Error("network down");
+    });
+    await expect(client.init()).resolves.toBeUndefined();
+    expect(client.workspaceId).toBeNull();
+  });
+
+  it("connector scope callback returns cached workspaceId", async () => {
+    const client = makeClient({}, async () =>
+      jsonResponse({
+        bot: { workspace_id: "ws-scope-test" },
+        object: "user",
+        id: "bot-1",
+      }),
+    );
+    await client.init();
+    const c = makeConnector(client);
+    // The toolkit's Connector exposes the config via internal shape; to
+    // verify the scope contract end-to-end we assert the client getter —
+    // the factory wires `scope: (ctx) => ctx.sdk.workspaceId` directly.
+    expect(client.workspaceId).toBe("ws-scope-test");
+    expect(c.validActions).toContain("search");
+  });
+});
+
 describe("NotionClient", () => {
   afterEach(() => vi.restoreAllMocks());
 

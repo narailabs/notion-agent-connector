@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.1 — 2026-04-22
+
+### Added
+- `scope(ctx)` now returns the Notion `workspaceId` when known, and `null` otherwise. Hardships and patterns.yaml are keyed by workspace when the integration's token resolves a workspace.
+- `NotionClient` exposes `workspaceId: string | null` and an `async init()` method that populates it via `GET /v1/users/me`. `init()` is best-effort and never throws — lookup failures log to stderr and leave `workspaceId` null.
+- `defaultSdk` now awaits `client.init()` before returning.
+
 ## 3.0.0 — 2026-04-22
 
 ### BREAKING
