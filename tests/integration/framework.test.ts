@@ -109,11 +109,13 @@ describe("hardship logging integration", () => {
     });
     await c.fetch("search", { query: "x" });
 
+    // Toolkit 3.0 uses tiered layout: global/hardships.jsonl (scope returns null → global tier).
     const logPath = path.join(
       tmpHome,
       ".claude",
       "connectors",
       "notion",
+      "global",
       "hardships.jsonl",
     );
     expect(fs.existsSync(logPath)).toBe(true);
@@ -133,11 +135,13 @@ describe("hardship logging integration", () => {
       "get_page",
       { page_id: "a1b2c3d4e5f6789012345678901234ab" },
     );
+    // Toolkit 3.0 uses tiered layout: global/hardships.jsonl (scope returns null → global tier).
     const projectLog = path.join(
       tmpCwd,
       ".claude",
       "connectors",
       "notion",
+      "global",
       "hardships.jsonl",
     );
     expect(fs.existsSync(projectLog)).toBe(true);
@@ -150,11 +154,13 @@ describe("hardship logging integration", () => {
       credentials: async () => ({}),
     });
     await c.fetch("get_page", { page_id: "not-a-uuid" });
+    // Toolkit 3.0 uses tiered layout: global/hardships.jsonl (validation errors → global tier).
     const logPath = path.join(
       tmpHome,
       ".claude",
       "connectors",
       "notion",
+      "global",
       "hardships.jsonl",
     );
     expect(fs.existsSync(logPath)).toBe(true);
